@@ -26,11 +26,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from utils.path_resolver import get_config_dir
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 from base.decorators import mcp_tool_handler
 from base.persistence import AtomicJsonStore, SessionIdResolver
 
-mcp = FastMCP("policy-enforcement", instructions="Policy enforcement and compliance tracking")
+mcp = MCPServer("policy-enforcement", instructions="Policy enforcement and compliance tracking")
 
 # Paths
 MEMORY_PATH = get_config_dir()
