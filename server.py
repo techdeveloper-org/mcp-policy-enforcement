@@ -100,11 +100,15 @@ def enforce_policy_step(
 ) -> dict:
     """Enforce a specific policy step in the execution pipeline.
 
+    Records the step under a compare-and-swap ``modify`` cycle so a
+    concurrent writer updating a different step key cannot lose this
+    update, and vice versa: both retries replay against the freshly
+    loaded state rather than each overwriting the other's key.
+
     Args:
         step_number: Step number (0-13)
         step_name: Human-readable step name
     """
-    # Complete step mapping for all 15 steps (Step 0-14)
     script_map = {
         0: "00-prompt-generation/prompt-generation-policy.md",
         1: "01-task-breakdown/automatic-task-breakdown-policy.md",
@@ -122,14 +126,20 @@ def enforce_policy_step(
         13: "failure-prevention/common-failures-prevention.md",
     }
 
-    # Update state
-    state = _enforcer_store.load()
-    state[f"step_{step_number}"] = {
-        "name": step_name,
-        "status": "ENFORCED",
-        "timestamp": datetime.now().isoformat()
-    }
-    _enforcer_store.save(state)
+    def _mark_step_enforced(state: dict) -> None:
+        """Set the step_N entry on the dict handed to it by ``modify``.
+
+        Recomputes the timestamp on every call so a retried attempt
+        records the time its own write actually took effect rather than
+        the time of an earlier, superseded attempt.
+        """
+        state[f"step_{step_number}"] = {
+            "name": step_name,
+            "status": "ENFORCED",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    _enforcer_store.modify(_mark_step_enforced)
 
     policy_path = script_map.get(step_number)
     policy_exists = False
@@ -348,6 +358,11 @@ def record_policy_execution(
 ) -> dict:
     """Record a policy execution to flow-trace.json for tracking.
 
+    Appends the record under a compare-and-swap ``modify`` cycle so a
+    concurrent recorder for the same session cannot lose this execution:
+    a losing attempt replays its append against the freshly loaded
+    ``all_policies_executed`` list instead of overwriting it.
+
     Args:
         policy_name: Policy name (e.g., 'session-id-generator')
         policy_script: Script filename (e.g., 'session-id-generator.py')
@@ -359,34 +374,15 @@ def record_policy_execution(
         session_id: Session ID (auto-detected from .current-session.json if empty)
         sub_operations: JSON string of sub-operation records
     """
-    # Get session ID
     sid = session_id
     if not sid:
         sid = SessionIdResolver(MEMORY_PATH).get()
     if not sid:
         sid = "unknown"
 
-    session_dir = LOGS_PATH / sid
-    session_dir.mkdir(parents=True, exist_ok=True)
-    flow_trace_file = session_dir / "flow-trace.json"
+    flow_trace_file = LOGS_PATH / sid / "flow-trace.json"
+    flow_trace_store = AtomicJsonStore(flow_trace_file)
 
-    # Load or create flow-trace
-    if flow_trace_file.exists():
-        flow_trace = json.loads(flow_trace_file.read_text(encoding="utf-8"))
-    else:
-        flow_trace = {
-            "meta": {
-                "session_id": sid,
-                "created_at": datetime.now().isoformat(),
-                "schema_version": "1.0"
-            },
-            "user_input": {},
-            "all_policies_executed": [],
-            "execution_summary": {"total_policies_executed": 0},
-            "decisions_timeline": []
-        }
-
-    # Parse JSON params
     try:
         inp = json.loads(input_params)
     except (json.JSONDecodeError, TypeError):
@@ -396,43 +392,62 @@ def record_policy_execution(
     except (json.JSONDecodeError, TypeError):
         out = {}
 
-    # Build policy record
-    record = {
-        "policy_name": policy_name,
-        "policy_script": policy_script,
-        "policy_type": policy_type,
-        "timestamp": datetime.now().isoformat(),
-        "duration_ms": duration_ms,
-        "input": inp,
-        "output": out,
-        "decision": decision
-    }
-
+    parsed_sub_operations = None
     if sub_operations:
         try:
-            record["sub_operations"] = json.loads(sub_operations)
+            parsed_sub_operations = json.loads(sub_operations)
         except (json.JSONDecodeError, TypeError):
-            pass
+            parsed_sub_operations = None
 
-    flow_trace["all_policies_executed"].append(record)
-    flow_trace["execution_summary"]["total_policies_executed"] = len(
-        flow_trace["all_policies_executed"]
-    )
-    flow_trace["decisions_timeline"].append({
-        "timestamp": record["timestamp"],
-        "policy": policy_name,
-        "decision": decision
-    })
+    default_flow_trace = {
+        "meta": {
+            "session_id": sid,
+            "created_at": datetime.now().isoformat(),
+            "schema_version": "1.0"
+        },
+        "user_input": {},
+        "all_policies_executed": [],
+        "execution_summary": {"total_policies_executed": 0},
+        "decisions_timeline": []
+    }
 
-    # Atomic save
-    temp = flow_trace_file.with_suffix(".tmp")
-    temp.write_text(json.dumps(flow_trace, indent=2, default=str), encoding="utf-8")
-    temp.replace(flow_trace_file)
+    def _append_execution(flow_trace: dict) -> None:
+        """Append one policy-execution record and its timeline entry.
+
+        Recomputes the record timestamp on every call so a retried
+        attempt records the time its own write actually took effect
+        rather than the time of an earlier, superseded attempt.
+        """
+        now = datetime.now().isoformat()
+        record = {
+            "policy_name": policy_name,
+            "policy_script": policy_script,
+            "policy_type": policy_type,
+            "timestamp": now,
+            "duration_ms": duration_ms,
+            "input": inp,
+            "output": out,
+            "decision": decision
+        }
+        if parsed_sub_operations is not None:
+            record["sub_operations"] = parsed_sub_operations
+
+        flow_trace["all_policies_executed"].append(record)
+        flow_trace["execution_summary"]["total_policies_executed"] = len(
+            flow_trace["all_policies_executed"]
+        )
+        flow_trace["decisions_timeline"].append({
+            "timestamp": now,
+            "policy": policy_name,
+            "decision": decision
+        })
+
+    published = flow_trace_store.modify(_append_execution, default=default_flow_trace)
 
     return {
         "session_id": sid,
         "policy": policy_name,
-        "total_recorded": len(flow_trace["all_policies_executed"])
+        "total_recorded": len(published["all_policies_executed"])
     }
 
 
